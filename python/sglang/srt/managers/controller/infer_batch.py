@@ -508,7 +508,7 @@ class Batch:
             self_val = getattr(self, item, None)
             # logit_bias can be None
             if self_val is not None:
-                setattr(self, item, self_val[new_indices])
+                setattr(new_batch, item, self_val[new_indices])
         return new_batch
     
     def concat(self, other):

@@ -147,8 +147,8 @@ class ModelTpServer:
         # Init running status
         self.forward_queue: List[Req] = []
         self.delayed_batch : Batch = None
-
         self.running_batch: Batch = None
+
         self.out_pyobjs = []
         self.decode_forward_ct = 0
         self.stream_interval = server_args.stream_interval
@@ -279,6 +279,7 @@ class ModelTpServer:
         # For fast populate
         if self.token_to_kv_pool.available_size() / self.max_total_num_tokens >= 0.5:
             return self.forward_step()
+
         budget = SchedulingBudget(self.chunk_prefill_budget, 0)
         if self.delayed_batch:
             if self.running_batch:
@@ -286,9 +287,11 @@ class ModelTpServer:
             else:
                 self.running_batch = self.delayed_batch
             self.delayed_batch = None
+
         preempted, delayed_batch = self._schedule_running(budget)
         self.delayed_batch = delayed_batch
         self.forward_queue.extend(preempted)
+        
         if not self.disable_regex_jump_forward and self.running_batch:
             # check for jump-forward
             jump_forward_reqs = self.running_batch.check_for_jump_forward(self.model_runner)
@@ -313,9 +316,7 @@ class ModelTpServer:
         if budget.get_remaining_token_budget() <= 0:
             scheduled_waiting_batch = None
         else:
-            self.check_req_hit(self.forward_queue, False)
             self.forward_queue = self.scheduler.get_priority_queue(self.forward_queue)
-            # scheduled_waiting_batch = self._schedule_waiting(budget)
             scheduled_waiting_batch = self.schedule_within_group(self.forward_queue, self.max_running_requests, budget)
             if scheduled_waiting_batch is not None:
                 self.forward_queue = [x for x in self.forward_queue if x not in scheduled_waiting_batch.reqs]
@@ -337,10 +338,6 @@ class ModelTpServer:
             output = self.model_runner.forward(batch, ForwardMode.EXTEND)
             next_token_ids, _ = batch.sample(output.next_token_logits)
             last_logprobs = output.next_token_logprobs
-            # logits, (_, _, _, _, last_logprobs) = self.model_runner.forward(
-            #     batch, ForwardMode.EXTEND
-            # )
-
             next_token_ids = next_token_ids.cpu().tolist()
         else:
             next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
@@ -537,6 +534,7 @@ class ModelTpServer:
                 budget.schedule_new_tokens(new_tokens)
                 scheduled.append(target_idx)
                 out_cache_loc = batch.token_to_kv_pool.alloc(new_tokens)
+                
                 batch.req_to_token_pool.req_to_token[
                     req_pool_indices_cpu[target_idx],
                     target_to_schedule.num_cached_tokens : target_to_schedule.num_cached_tokens + new_tokens
@@ -550,15 +548,16 @@ class ModelTpServer:
             delayed_batch = None
                
         if len(scheduled) < len(batch.reqs):
+            logger.debug(f'GPU: 0 preempted/delayed {len(batch.reqs) - len(scheduled)} requests')
             batch.filter_batch(scheduled)
-
+            
         # set out_cache_loc
         if not out_cache_locs:
             pass
         out_cache_locs = torch.cat(out_cache_locs, dim=0)
         batch.out_cache_loc = out_cache_locs
         batch.out_cache_cont_start = batch.out_cache_cont_end = None
-    
+        
         batch.prepare_for_decode_chunk_prefill()
         return preempted, delayed_batch
 
