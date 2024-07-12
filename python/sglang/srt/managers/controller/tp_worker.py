@@ -321,7 +321,7 @@ class ModelTpServer:
                 self.forward_queue = [x for x in self.forward_queue if x not in scheduled_waiting_batch.reqs]
         
         if scheduled_waiting_batch is not None:
-            scheduled_waiting_batch.prepare_for_extend(self.model_config.vocab_size, self.int_token_logit_bias)
+            scheduled_waiting_batch.prepare_for_extend_chunk_prefill(self.model_config.vocab_size, self.int_token_logit_bias)
             if self.running_batch:
                 self.running_batch.concat(scheduled_waiting_batch)
             else:
@@ -551,7 +551,7 @@ class ModelTpServer:
                
         if len(scheduled) < len(batch.reqs):
             batch.filter_batch(scheduled)
-            
+
         # set out_cache_loc
         if not out_cache_locs:
             pass
