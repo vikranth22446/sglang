@@ -14,7 +14,7 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
+import time
 from sglang.srt.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -118,6 +118,7 @@ class TokenizerManager:
             self.create_handle_loop()
 
         obj.post_init()
+        arrival_time = time.time()
         is_single = obj.is_single
         if is_single:
             rid = obj.rid
@@ -160,6 +161,7 @@ class TokenizerManager:
                 logprob_start_len=obj.logprob_start_len,
                 top_logprobs_num=obj.top_logprobs_num,
                 stream=obj.stream,
+                arrival_time=arrival_time
             )
             self.send_to_router.send_pyobj(tokenized_obj)
 

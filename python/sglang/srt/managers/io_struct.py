@@ -105,6 +105,7 @@ class TokenizedGenerateReqInput:
     logprob_start_len: int
     top_logprobs_num: int
     stream: bool
+    arrival_time: float
 
 
 @dataclass

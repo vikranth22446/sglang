@@ -66,13 +66,14 @@ class FINISH_ABORT(BaseFinishReason):
 
 
 class Req:
-    def __init__(self, rid, origin_input_text, origin_input_ids):
+    def __init__(self, rid, origin_input_text, origin_input_ids, arrival_time=None):
         self.rid = rid
         self.origin_input_text = origin_input_text
         self.origin_input_ids_unpadded = origin_input_ids  # Before image padding
         self.origin_input_ids = origin_input_ids
         self.output_ids = []  # Each decode stage's output ids
         self.input_ids = None  # input_ids = origin_input_ids + output_ids
+        self.arrival_time = None
 
         # For incremental decode
         self.decoded_text = ""
@@ -120,6 +121,10 @@ class Req:
         self.regex_fsm: RegexGuide = None
         self.regex_fsm_state: int = 0
         self.jump_forward_map: JumpForwardMap = None
+
+        # For chunk-prefill
+        self.num_cached_tokens = 0
+        self.num_inflight_tokens = 0
 
     # whether request reached finished condition
     def finished(self) -> bool:
@@ -195,7 +200,30 @@ class Req:
                 if stop_str in tail_str or stop_str in self.decoded_text:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                     return
+    # NOTE: Currently sglang clears output tokens when recompute (??)
+    #       so a prefill chunk will never involve output tokens
+    #       Change this function if this is nolonger true
+    def get_inflight_token_ids(self) -> List[int]:
+        # logger.debug(f"num_computed_tokens={self.num_computed_tokens}, num_inflight_tokens={self.num_inflight_tokens}, prompt_len={len(self.input_ids)}, output_len={len(self.output_ids)}")
+        start_idx = self.num_cached_tokens
+        prompt_len = len(self.input_ids)
+        if start_idx >= prompt_len:
+            assert self.num_cached_tokens == prompt_len + len(self.output_ids) - 1, \
+            f'prompt: {prompt_len}, cached: {self.num_cached_tokens}, output: {len(self.output_ids)}'
+            assert self.num_inflight_tokens == 1
+            return [self.output_ids[-1]]
+        return self.input_ids[start_idx : start_idx + self.num_inflight_tokens]
 
+    def get_context_len(self):
+        return self.num_cached_tokens + self.num_inflight_tokens
+    
+    def update_after_step(self):
+        self.num_cached_tokens += self.num_inflight_tokens
+        self.num_inflight_tokens = 0
+    
+    def get_num_unfinished_tokens(self):
+        return len(self.input_ids) + len(self.output_ids) - self.num_cached_tokens
+    
     def jump_forward_and_retokenize(self, jump_forward_str, next_state):
         if self.origin_input_text is None:
             # Recovering text can only use unpadded ids
@@ -249,6 +277,18 @@ class Req:
     def __repr__(self):
         return f"rid(n={self.rid}, " f"input_ids={self.origin_input_ids}, "
 
+
+@dataclass
+class SchedulingBudget:
+    max_new_tokens: int
+    scheduled_tokens: int
+    
+    def get_remaining_token_budget(self):
+        return self.max_new_tokens - self.scheduled_tokens
+
+    def schedule_new_tokens(self, num_tokens):
+        assert num_tokens <= self.get_remaining_token_budget()
+        self.scheduled_tokens += num_tokens
 
 @dataclass
 class Batch:
@@ -460,7 +500,64 @@ class Batch:
         self.filter_batch(sorted_indices)
 
         return retracted_reqs
-
+   
+    def copy_from(self, selected_indices: List[int]):
+        reqs = [self.reqs[i] for i in selected_indices]
+        new_indices = torch.tensor(selected_indices, dtype=torch.int32, device="cuda")
+        new_batch = Batch.init_new(reqs, self.req_to_token_pool, self.token_to_kv_pool, self.tree_cache)
+        new_batch.seq_lens = self.seq_lens[new_indices]
+        new_batch.req_pool_indices = self.req_pool_indices[new_indices]
+        new_batch.position_ids_offsets = self.position_ids_offsets[new_indices]
+        new_batch.return_logprob = any(req.return_logprob for req in reqs)
+        new_batch.top_logprobs_nums = [self.top_logprobs_nums[i] for i in selected_indices]
+        for item in [
+            "temperatures",
+            "top_ps",
+            "top_ks",
+            "frequency_penalties",
+            "presence_penalties",
+            "logit_bias",
+        ]:
+            self_val = getattr(self, item, None)
+            # logit_bias can be None
+            if self_val is not None:
+                setattr(self, item, self_val[new_indices])
+        return new_batch
+    
+    def concat(self, other):
+        self.reqs.extend(other.reqs)
+        
+        self.out_cache_cont_start = self.out_cache_cont_end = None
+        self.return_logprob = any(req.return_logprob for req in self.reqs)
+        self.extend_num_tokens = other.extend_num_tokens
+        self.top_logprobs_nums.extend(other.top_logprobs_nums)
+        
+        def cat_or_set(attr):
+            s, t = getattr(self, attr), getattr(other, attr)
+            if t is None:
+                return
+            if s is None:
+                setattr(self, attr, t)
+            else:
+                setattr(
+                    self, attr, torch.cat([s, t])
+                )
+        
+        for item in [
+            "input_ids",
+            "req_pool_indices",
+            "seq_lens",
+            "prefix_lens",
+            "position_ids_offsets",
+            "out_cache_loc",
+            "temperatures",
+            "top_ps",
+            "top_ks",
+            "frequency_penalties",
+            "presence_penalties",
+            "logit_bias",
+        ]:
+            cat_or_set(item)
     def check_for_jump_forward(self, model_runner):
         jump_forward_reqs = []
         filter_indices = [i for i in range(len(self.reqs))]
@@ -574,6 +671,16 @@ class Batch:
         self.req_to_token_pool.req_to_token[
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
+
+    # TODO: Add image input support
+    def prepare_for_decode_chunk_prefill(self):
+        device = 'cuda'
+        input_ids = [r.get_inflight_token_ids() for r in self.reqs]
+        self.input_id_lengths = [len(ids) for ids in input_ids]
+        input_ids = sum(input_ids, [])
+        self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device=device)
+        self.seq_lens = torch.tensor([r.get_context_len() for r in self.reqs], dtype=torch.int32, device=device)
+        self.prefix_lens = torch.tensor([r.num_cached_tokens for r in self.reqs], dtype=torch.int32, device=device)
 
     def filter_batch(self, unfinished_indices: List[int]):
         self.reqs = [self.reqs[i] for i in unfinished_indices]

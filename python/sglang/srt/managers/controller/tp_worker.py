@@ -5,7 +5,7 @@ import logging
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import rpyc
 import torch
@@ -21,6 +21,7 @@ from sglang.srt.managers.controller.infer_batch import (
     Batch,
     ForwardMode,
     Req,
+    SchedulingBudget
 )
 from sglang.srt.managers.controller.model_runner import ModelRunner
 from sglang.srt.managers.controller.radix_cache import RadixCache
@@ -65,6 +66,7 @@ class ModelTpServer:
         self.dp_size = server_args.dp_size
         self.schedule_heuristic = server_args.schedule_heuristic
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
+
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -144,6 +146,8 @@ class ModelTpServer:
 
         # Init running status
         self.forward_queue: List[Req] = []
+        self.delayed_batch : Batch = None
+
         self.running_batch: Batch = None
         self.out_pyobjs = []
         self.decode_forward_ct = 0
@@ -176,6 +180,7 @@ class ModelTpServer:
         )
         self.new_token_ratio_decay = global_config.new_token_ratio_decay
         self.new_token_ratio_recovery = global_config.new_token_ratio_recovery
+        self.chunk_prefill_budget = server_args.chunk_prefill_budget
 
     def exposed_step(self, recv_reqs):
         if self.tp_size * self.dp_size != 1:
@@ -194,7 +199,10 @@ class ModelTpServer:
                     raise ValueError(f"Invalid request: {recv_req}")
 
             # Forward
-            self.forward_step()
+            if self.chunk_prefill_budget > 1:
+                self.budget_forward_step()
+            else:
+                self.forward_step()
         except Exception:
             logger.error("Exception in ModelTpServer:\n" + get_exception_traceback())
             raise
@@ -266,11 +274,299 @@ class ModelTpServer:
                         "KV cache pool leak detected!"
                     )
 
+    @torch.inference_mode()
+    def budget_forward_step(self):
+        # For fast populate
+        if self.token_to_kv_pool.available_size() / self.max_total_num_tokens >= 0.5:
+            return self.forward_step()
+        budget = SchedulingBudget(self.chunk_prefill_budget, 0)
+        if self.delayed_batch:
+            if self.running_batch:
+                self.running_batch.concat(self.delayed_batch)
+            else:
+                self.running_batch = self.delayed_batch
+            self.delayed_batch = None
+        preempted, delayed_batch = self._schedule_running(budget)
+        self.delayed_batch = delayed_batch
+        self.forward_queue.extend(preempted)
+        if not self.disable_regex_jump_forward and self.running_batch:
+            # check for jump-forward
+            jump_forward_reqs = self.running_batch.check_for_jump_forward(self.model_runner)
+
+            # check for image jump-forward
+            for req in jump_forward_reqs:
+                if req.pixel_values is not None:
+                    (
+                        req.input_ids,
+                        req.image_offset,
+                    ) = self.model_runner.model.pad_input_ids(
+                        req.input_ids,
+                        req.pad_value,
+                        req.pixel_values.shape,
+                        req.image_size,
+                    )
+            self.forward_queue.extend(jump_forward_reqs)
+            
+        if self.running_batch and not self.running_batch.is_empty():
+            self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
+
+        if budget.get_remaining_token_budget() <= 0:
+            scheduled_waiting_batch = None
+        else:
+            self.check_req_hit(self.forward_queue, False)
+            self.forward_queue = self.scheduler.get_priority_queue(self.forward_queue)
+            # scheduled_waiting_batch = self._schedule_waiting(budget)
+            scheduled_waiting_batch = self.schedule_within_group(self.forward_queue, self.max_running_requests, budget)
+            if scheduled_waiting_batch is not None:
+                self.forward_queue = [x for x in self.forward_queue if x not in scheduled_waiting_batch.reqs]
+        
+        if scheduled_waiting_batch is not None:
+            scheduled_waiting_batch.prepare_for_extend(self.model_config.vocab_size, self.int_token_logit_bias)
+            if self.running_batch:
+                self.running_batch.concat(scheduled_waiting_batch)
+            else:
+                self.running_batch = scheduled_waiting_batch
+        if not self.running_batch or self.running_batch.is_empty():
+            return []
+       
+        # Logging
+        batch = self.running_batch
+        num_batched_tokens = batch.input_ids.shape[0]
+
+        if num_batched_tokens > 0:
+            output = self.model_runner.forward(batch, ForwardMode.EXTEND)
+            next_token_ids, _ = batch.sample(output.next_token_logits)
+            last_logprobs = output.next_token_logprobs
+            # logits, (_, _, _, _, last_logprobs) = self.model_runner.forward(
+            #     batch, ForwardMode.EXTEND
+            # )
+
+            next_token_ids = next_token_ids.cpu().tolist()
+        else:
+            next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
+            logits = last_logprobs = None
+            
+        prefill_token_logprobs, normalized_prompt_logprobs, prefill_top_logprobs, decode_top_logprobs = None, None, None, None
+        # Only batch transfer the selected logprobs of the next token to CPU to reduce overhead.
+        reqs = batch.reqs
+        if last_logprobs is not None:
+            last_token_logprobs = last_logprobs[
+                torch.arange(len(batch.reqs), device=next_token_ids.device),
+                next_token_ids,
+            ].tolist()
+
+        # Check finish condition
+        pt = 0
+        for i, (req, next_tok_id) in enumerate(zip(reqs, next_token_ids)):
+            req.update_after_step()
+            if req.get_num_unfinished_tokens() == 0:
+                req.completion_tokens_wo_jump_forward += 1
+                req.output_ids.append(next_tok_id)
+                req.check_finished()
+
+                if req.return_logprob:
+                    req.normalized_prompt_logprob = normalized_prompt_logprobs[i]
+
+                    # If logprob_start_len > 0, then first logprob_start_len prompt tokens will be ignored.
+                    req.prefill_token_logprobs = list(
+                        zip(
+                            prefill_token_logprobs[pt : pt + req.extend_input_len - 1],
+                            req.input_ids[-req.extend_input_len + 1 :],
+                        )
+                    )
+                    if req.logprob_start_len == 0:
+                        req.prefill_token_logprobs = [
+                            (None, req.input_ids[0])
+                        ] + req.prefill_token_logprobs
+                    req.decode_token_logprobs = [
+                        (last_token_logprobs[i], next_token_ids[i])
+                    ]
+
+                if req.top_logprobs_num > 0:
+                    req.prefill_top_logprobs = prefill_top_logprobs[i]
+                    if req.logprob_start_len == 0:
+                        req.prefill_top_logprobs = [None] + req.prefill_top_logprobs
+                    req.decode_top_logprobs = [decode_top_logprobs[i]]
+
+            pt += req.extend_input_len
+
+        self.handle_finished_requests(batch)
+        if batch.is_empty():
+            self.running_batch = None
+
+    def schedule_within_group(
+        self, 
+        target_waiting_queue: List[Req], 
+        max_schedule_allowed: int,
+        budget: SchedulingBudget = None
+    ):
+        # Add requests if there is available space
+        can_run_list = []
+        new_batch_total_tokens = 0
+        new_batch_input_tokens = 0
+        total_batched_prompt_len = 0
+
+        available_size = (
+            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
+        )
+        if self.running_batch:
+            reservation = sum(
+                [
+                    (r.max_new_tokens() - len(r.output_ids)) * self.new_token_ratio
+                    for r in self.running_batch.reqs
+                ]
+            )
+            available_size -= reservation
+        req: Req
+        for req in target_waiting_queue:
+            if budget and budget.get_remaining_token_budget() <= 0:
+                break
+            if max_schedule_allowed <= 0:
+                break
+            if req.return_logprob:
+                # Need at least two tokens to compute normalized logprob
+                if req.extend_input_len < 2:
+                    delta = 2 - req.extend_input_len
+                    req.extend_input_len += delta
+                    req.prefix_indices = req.prefix_indices[:-delta]
+                    if req.image_offset is not None:
+                        req.image_offset += delta
+            if req.extend_input_len == 0 and req.max_new_tokens() > 0:
+                # Need at least one token to compute logits
+                req.extend_input_len = 1
+                req.prefix_indices = req.prefix_indices[:-1]
+                if req.image_offset is not None:
+                    req.image_offset += 1
+            if budget:
+                num_new_tokens = min(budget.get_remaining_token_budget(), req.extend_input_len)
+            else:
+                num_new_tokens = req.extend_input_len
+            if (
+                req.extend_input_len + req.max_new_tokens() + new_batch_total_tokens
+                < available_size
+                and req.extend_input_len + new_batch_input_tokens
+                < self.max_prefill_tokens
+            ):
+                delta = self.tree_cache.inc_lock_ref(req.last_node)
+                available_size += delta
+
+                if not (
+                    req.extend_input_len + req.max_new_tokens() + new_batch_total_tokens
+                    < available_size
+                ):
+                    # Undo locking
+                    delta = self.tree_cache.dec_lock_ref(req.last_node)
+                    available_size += delta
+                    break
+                else:
+                    req.num_inflight_tokens = num_new_tokens
+                    req.num_cached_tokens = len(req.prefix_indices)
+                    if budget:
+                        budget.schedule_new_tokens(num_new_tokens)
+                    # Add this request to the running batch
+                    can_run_list.append(req)
+                    new_batch_total_tokens += (
+                        req.extend_input_len + req.max_new_tokens()
+                    )
+                    new_batch_input_tokens += req.num_inflight_tokens
+                    total_batched_prompt_len += len(req.input_ids)
+                    max_schedule_allowed -= 1
+                    
+        if len(can_run_list) == 0:
+            return None
+
+        new_batch = Batch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool,
+            self.tree_cache,
+        )
+        return new_batch
+
+    def _schedule_running(
+        self, 
+        budget: SchedulingBudget
+    ) -> Tuple[List[Req], Batch]:
+        batch = self.running_batch
+        if batch is None or batch.is_empty():
+            return [], None
+        current_running_idx = sorted(
+            [i for i in range(len(batch.reqs))],
+            key=lambda i: (batch.reqs[i].arrival_time, len(batch.reqs[i].output_ids))
+        )
+        req_pool_indices_cpu = batch.req_pool_indices.cpu().tolist()
+        preempted = []
+        scheduled = []
+        batch.out_cache_loc = None
+        out_cache_locs = []
+        while current_running_idx:
+            if budget.get_remaining_token_budget() <= 0:
+                break
+            # try to schedule each request
+            target_idx = current_running_idx.pop(0)
+            target_to_schedule = batch.reqs[target_idx]
+            # 1. check required new memory and evict if needed
+            # logger.debug(f'output_len: {len(target_to_schedule.output_ids)}, unfinished: {target_to_schedule.get_num_unfinished_tokens()}, budget: {budget.get_remaining_token_budget()}')
+            new_tokens = min(target_to_schedule.get_num_unfinished_tokens(), budget.get_remaining_token_budget())
+            if (batch.token_to_kv_pool.available_size() < new_tokens 
+                and not batch.tree_cache.disable):
+                batch.tree_cache.evict(new_tokens, batch.token_to_kv_pool.dec_refs)
+            # 2. if not enough, evict running requests
+            while batch.token_to_kv_pool.available_size() < new_tokens:
+                if not current_running_idx:
+                    evict_idx = target_idx
+                    evict_req = target_to_schedule
+                else:
+                    evict_idx = current_running_idx.pop()
+                    evict_req = batch.reqs[evict_idx]
+                    
+                batch.tree_cache.dec_lock_ref(evict_req.last_node)
+                token_indices = batch.req_to_token_pool.req_to_token[
+                    req_pool_indices_cpu[evict_idx]
+                ][: evict_req.num_cached_tokens]
+                batch.token_to_kv_pool.dec_refs(token_indices)
+                batch.req_to_token_pool.free(req_pool_indices_cpu[evict_idx])
+                
+                evict_req.reset_state()
+                preempted.append(evict_req)
+                # not enought memory to schedule
+                if evict_idx == target_idx:
+                    break
+            else:
+            #3. schedule it, allocate and set workload
+                budget.schedule_new_tokens(new_tokens)
+                scheduled.append(target_idx)
+                out_cache_loc = batch.token_to_kv_pool.alloc(new_tokens)
+                batch.req_to_token_pool.req_to_token[
+                    req_pool_indices_cpu[target_idx],
+                    target_to_schedule.num_cached_tokens : target_to_schedule.num_cached_tokens + new_tokens
+                ] = out_cache_loc
+                target_to_schedule.num_inflight_tokens = new_tokens
+                out_cache_locs.append(out_cache_loc)
+        
+        if current_running_idx:
+            delayed_batch = batch.copy_from(current_running_idx)
+        else:
+            delayed_batch = None
+               
+        if len(scheduled) < len(batch.reqs):
+            batch.filter_batch(scheduled)
+            
+        # set out_cache_loc
+        if not out_cache_locs:
+            pass
+        out_cache_locs = torch.cat(out_cache_locs, dim=0)
+        batch.out_cache_loc = out_cache_locs
+        batch.out_cache_cont_start = batch.out_cache_cont_end = None
+    
+        batch.prepare_for_decode_chunk_prefill()
+        return preempted, delayed_batch
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
-        req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
+        req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids, arrival_time=recv_req.arrival_time)
         req.pixel_values = recv_req.pixel_values
         if req.pixel_values is not None:
             req.pad_value = [
