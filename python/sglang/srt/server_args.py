@@ -30,6 +30,8 @@ class ServerArgs:
     max_running_requests: Optional[int] = None
     schedule_heuristic: str = "lpm"
     schedule_conservativeness: float = 1.0
+    chunk_prefill_budget: int = 0
+
 
     # Other runtime options
     tp_size: int = 1
@@ -183,6 +185,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_prefill_tokens,
             help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length.",
+        )
+        parser.add_argument(
+            "--chunk-prefill-budget",
+            type=int,
+            default=ServerArgs.chunk_prefill_budget,
+            help="The chunk prefill budget",
         )
         parser.add_argument(
             "--max-running-requests",

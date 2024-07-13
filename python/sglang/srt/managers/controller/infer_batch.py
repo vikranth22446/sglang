@@ -72,16 +72,16 @@ class FINISH_ABORT(BaseFinishReason):
 
 
 class Req:
+    def __init__(self, rid, origin_input_text, origin_input_ids, arrival_time=None):
     """Store all inforamtion of a request."""
 
-    def __init__(self, rid, origin_input_text, origin_input_ids):
-        # Input and output info
         self.rid = rid
         self.origin_input_text = origin_input_text
         self.origin_input_ids_unpadded = origin_input_ids  # Before image padding
         self.origin_input_ids = origin_input_ids
         self.output_ids = []  # Each decode stage's output ids
         self.input_ids = None  # input_ids = origin_input_ids + output_ids
+        self.arrival_time = None
 
         # For incremental decoding
         self.decoded_text = ""
@@ -128,6 +128,10 @@ class Req:
         self.regex_fsm: RegexGuide = None
         self.regex_fsm_state: int = 0
         self.jump_forward_map: JumpForwardMap = None
+
+        # For chunk-prefill
+        self.num_cached_tokens = 0
+        self.num_inflight_tokens = 0
 
     # whether request reached finished condition
     def finished(self) -> bool:
@@ -203,7 +207,30 @@ class Req:
                 if stop_str in tail_str or stop_str in self.decoded_text:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                     return
+    # NOTE: Currently sglang clears output tokens when recompute (??)
+    #       so a prefill chunk will never involve output tokens
+    #       Change this function if this is nolonger true
+    def get_inflight_token_ids(self) -> List[int]:
+        # logger.debug(f"num_computed_tokens={self.num_computed_tokens}, num_inflight_tokens={self.num_inflight_tokens}, prompt_len={len(self.input_ids)}, output_len={len(self.output_ids)}")
+        start_idx = self.num_cached_tokens
+        prompt_len = len(self.input_ids)
+        if start_idx >= prompt_len:
+            assert self.num_cached_tokens == prompt_len + len(self.output_ids) - 1, \
+            f'prompt: {prompt_len}, cached: {self.num_cached_tokens}, output: {len(self.output_ids)}'
+            assert self.num_inflight_tokens == 1
+            return [self.output_ids[-1]]
+        return self.input_ids[start_idx : start_idx + self.num_inflight_tokens]
 
+    def get_context_len(self):
+        return self.num_cached_tokens + self.num_inflight_tokens
+    
+    def update_after_step(self):
+        self.num_cached_tokens += self.num_inflight_tokens
+        self.num_inflight_tokens = 0
+    
+    def get_num_unfinished_tokens(self):
+        return len(self.input_ids) + len(self.output_ids) - self.num_cached_tokens
+    
     def jump_forward_and_retokenize(self, jump_forward_str, next_state):
         if self.origin_input_text is None:
             # Recovering text can only use unpadded ids
@@ -257,6 +284,18 @@ class Req:
     def __repr__(self):
         return f"rid(n={self.rid}, " f"input_ids={self.origin_input_ids}, "
 
+
+@dataclass
+class SchedulingBudget:
+    max_new_tokens: int
+    scheduled_tokens: int
+    
+    def get_remaining_token_budget(self):
+        return self.max_new_tokens - self.scheduled_tokens
+
+    def schedule_new_tokens(self, num_tokens):
+        assert num_tokens <= self.get_remaining_token_budget()
+        self.scheduled_tokens += num_tokens
 
 @dataclass
 class Batch:
@@ -433,13 +472,8 @@ class Batch:
 
     def retract_decode(self):
         sorted_indices = [i for i in range(len(self.reqs))]
-        # TODO(lsyin): improve the priority of retraction
         sorted_indices.sort(
-            key=lambda i: (
-                len(self.reqs[i].output_ids),
-                -len(self.reqs[i].origin_input_ids),
-            ),
-            reverse=True,
+            key=lambda i: (self.reqs[i].arrival_time, len(self.reqs[i].output_ids))
         )
 
         retracted_reqs = []
@@ -457,21 +491,70 @@ class Batch:
             ][last_uncached_pos : seq_lens_cpu[idx]]
             self.token_to_kv_pool.dec_refs(token_indices)
 
-            # release the last node
             self.tree_cache.dec_lock_ref(req.last_node)
-
-            req.prefix_indices = None
-            req.last_node = None
-            req.extend_input_len = 0
-
-            # For incremental logprobs
-            req.last_update_decode_tokens = 0
-            req.logprob_start_len = 10**9
+            req.reset_state()
 
         self.filter_batch(sorted_indices)
 
         return retracted_reqs
-
+   
+    def copy_from(self, selected_indices: List[int]):
+        reqs = [self.reqs[i] for i in selected_indices]
+        new_indices = torch.tensor(selected_indices, dtype=torch.int32, device="cuda")
+        new_batch = Batch.init_new(reqs, self.req_to_token_pool, self.token_to_kv_pool, self.tree_cache)
+        new_batch.seq_lens = self.seq_lens[new_indices]
+        new_batch.req_pool_indices = self.req_pool_indices[new_indices]
+        new_batch.position_ids_offsets = self.position_ids_offsets[new_indices]
+        new_batch.return_logprob = any(req.return_logprob for req in reqs)
+        new_batch.top_logprobs_nums = [self.top_logprobs_nums[i] for i in selected_indices]
+        for item in [
+            "temperatures",
+            "top_ps",
+            "top_ks",
+            "frequency_penalties",
+            "presence_penalties",
+            "logit_bias",
+        ]:
+            self_val = getattr(self, item, None)
+            # logit_bias can be None
+            if self_val is not None:
+                setattr(new_batch, item, self_val[new_indices])
+        return new_batch
+    
+    def concat(self, other):
+        self.reqs.extend(other.reqs)
+        
+        self.out_cache_cont_start = self.out_cache_cont_end = None
+        self.return_logprob = any(req.return_logprob for req in self.reqs)
+        self.extend_num_tokens = other.extend_num_tokens
+        self.top_logprobs_nums.extend(other.top_logprobs_nums)
+        
+        def cat_or_set(attr):
+            s, t = getattr(self, attr), getattr(other, attr)
+            if t is None:
+                return
+            if s is None:
+                setattr(self, attr, t)
+            else:
+                setattr(
+                    self, attr, torch.cat([s, t])
+                )
+        
+        for item in [
+            "input_ids",
+            "req_pool_indices",
+            "seq_lens",
+            "prefix_lens",
+            "position_ids_offsets",
+            "out_cache_loc",
+            "temperatures",
+            "top_ps",
+            "top_ks",
+            "frequency_penalties",
+            "presence_penalties",
+            "logit_bias",
+        ]:
+            cat_or_set(item)
     def check_for_jump_forward(self, model_runner):
         jump_forward_reqs = []
         filter_indices = [i for i in range(len(self.reqs))]
@@ -585,6 +668,117 @@ class Batch:
         self.req_to_token_pool.req_to_token[
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
+
+    # TODO: Add image input support
+    def prepare_for_decode_chunk_prefill(self):
+        device = 'cuda'
+        input_ids = [r.get_inflight_token_ids() for r in self.reqs]
+        self.input_id_lengths = [len(ids) for ids in input_ids]
+        input_ids = sum(input_ids, [])
+        self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device=device)
+        self.seq_lens = torch.tensor([r.get_context_len() for r in self.reqs], dtype=torch.int32, device=device)
+        self.prefix_lens = torch.tensor([r.num_cached_tokens for r in self.reqs], dtype=torch.int32, device=device)
+
+    def prepare_for_extend_chunk_prefill(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
+        device = "cuda"
+        bs = len(self.reqs)
+        reqs = self.reqs
+        input_ids = [r.input_ids[len(r.prefix_indices) : len(r.prefix_indices) + r.num_inflight_tokens] for r in reqs]
+        prefix_indices = [r.prefix_indices for r in reqs]
+
+        # Handle prefix
+        flatten_input_ids = []
+        extend_lens = []
+        prefix_lens = []
+        seq_lens = [r.get_context_len() for r in reqs]
+
+        req_pool_indices = self.req_to_token_pool.alloc(bs)
+        req_pool_indices_cpu = req_pool_indices.cpu().numpy()
+        for i in range(bs):
+            flatten_input_ids.extend(input_ids[i])
+            extend_lens.append(len(input_ids[i]))
+
+            if len(prefix_indices[i]) == 0:
+                prefix_lens.append(0)
+            else:
+                prefix_lens.append(len(prefix_indices[i]))
+                self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
+                    : len(prefix_indices[i])
+                ] = prefix_indices[i]
+
+
+        position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
+        self.input_id_lengths = extend_lens
+        
+        # Alloc mem
+        seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
+        extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
+        assert extend_num_tokens == sum(extend_lens)
+        
+        out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
+        if out_cache_loc is None:
+            if not self.tree_cache.disable:
+                self.tree_cache.evict(extend_num_tokens, self.token_to_kv_pool.dec_refs)
+                out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
+
+            if out_cache_loc is None:
+                print("Prefill out of memory. This should nerver happen.")
+                self.tree_cache.pretty_print()
+                exit()
+
+        pt = 0
+        for i in range(bs):
+            self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
+                prefix_lens[i] : prefix_lens[i] + extend_lens[i]
+            ] = out_cache_loc[pt : pt + extend_lens[i]]
+            pt += extend_lens[i]
+
+        # Handle logit bias
+        logit_bias = torch.zeros((bs, vocab_size), dtype=torch.float32, device=device)
+        for i in range(bs):
+            if reqs[i].sampling_params.dtype == "int":
+                logit_bias[i] = int_token_logit_bias
+
+        # Set fields
+        self.input_ids = torch.tensor(
+            flatten_input_ids, dtype=torch.int32, device=device
+        )
+        self.pixel_values = [r.pixel_values for r in reqs]
+        self.image_sizes = [r.image_size for r in reqs]
+        self.image_offsets = [
+            r.image_offset - p_len for r, p_len in zip(reqs, prefix_lens)
+        ]
+        self.req_pool_indices = req_pool_indices
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        cached_prefix_lens = [r.get_context_len() - r.num_inflight_tokens for r in reqs]
+        self.prefix_lens = torch.tensor(cached_prefix_lens, dtype=torch.int32, device=device)
+        self.position_ids_offsets = position_ids_offsets
+        self.extend_num_tokens = extend_num_tokens
+        self.out_cache_loc = out_cache_loc
+        self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+
+        self.temperatures = torch.tensor(
+            [r.sampling_params.temperature for r in reqs],
+            dtype=torch.float,
+            device=device,
+        ).view(-1, 1)
+        self.top_ps = torch.tensor(
+            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
+        ).view(-1, 1)
+        self.top_ks = torch.tensor(
+            [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
+        ).view(-1, 1)
+        self.frequency_penalties = torch.tensor(
+            [r.sampling_params.frequency_penalty for r in reqs],
+            dtype=torch.float,
+            device=device,
+        )
+        self.presence_penalties = torch.tensor(
+            [r.sampling_params.presence_penalty for r in reqs],
+            dtype=torch.float,
+            device=device,
+        )
+        self.logit_bias = logit_bias
 
     def filter_batch(self, unfinished_indices: List[int]):
         self.reqs = [self.reqs[i] for i in unfinished_indices]
